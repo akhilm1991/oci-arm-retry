@@ -54,12 +54,12 @@ jobs:
               --subnet-id "$SUBNET" \
               --assign-public-ip true \
               --ssh-authorized-keys-file /tmp/ssh_key.pub \
-              --display-name trading-bot 2>&1)
+              --display-name trading-bot 2>&1) || true
             if echo "$OUT" | grep -q "ocid1.instance"; then
               echo "SUCCESS!"
               echo "$OUT" | python3 -c "import sys,json; d=json.load(sys.stdin)['data']; print('IP:', d.get('public-ip','pending'))"
               exit 0
             fi
-            echo "$AD: $(echo "$OUT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('message','?'))" 2>/dev/null || echo "failed")"
+            echo "$AD: $(echo "$OUT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('message','?'))" 2>/dev/null || echo "$OUT" | head -2)"
           done
           echo "All ADs at capacity — retrying in 10 min"
