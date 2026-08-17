@@ -3,14 +3,12 @@ on:
   schedule:
     - cron: '*/10 * * * *'
   workflow_dispatch:
-
 jobs:
   create-instance:
     runs-on: ubuntu-latest
     steps:
       - name: Install OCI CLI
         run: pip install oci-cli --quiet
-
       - name: Configure OCI
         run: |
           mkdir -p ~/.oci
@@ -24,7 +22,6 @@ jobs:
           region=us-ashburn-1
           key_file=$HOME/.oci/key.pem
           EOF
-
       - name: Check if already running
         id: check
         run: |
@@ -35,15 +32,14 @@ jobs:
             --query "length(data)" --raw-output 2>/dev/null || echo "0")
           echo "count=$COUNT" >> $GITHUB_OUTPUT
           echo "Existing running instances: $COUNT"
-
       - name: Try all ADs
         if: steps.check.outputs.count == '0'
         run: |
+          set +e
           SUBNET="ocid1.subnet.oc1.iad.aaaaaaaal3biypdof4bydty32oauen3sv5y22s2nos4zkdb3o2cgghyx5u4a"
           IMAGE="ocid1.image.oc1.iad.aaaaaaaac6tdovnommp6drirew5jopyjtug266lwt543yh37q4ngxebzkc7q"
           printf '%s\n' '${{ secrets.SSH_PUBLIC_KEY }}' > /tmp/ssh_key.pub
           CREATED=false
-
           for AD in "KOSs:US-ASHBURN-AD-1" "KOSs:US-ASHBURN-AD-2" "KOSs:US-ASHBURN-AD-3"; do
             echo "Trying $AD..."
             oci compute instance launch \
@@ -55,15 +51,19 @@ jobs:
               --subnet-id "$SUBNET" \
               --assign-public-ip true \
               --ssh-authorized-keys-file /tmp/ssh_key.pub \
-              --display-name trading-bot > /tmp/oci_out.txt 2>&1 \
-              && CREATED=true && break
-            head -5 /tmp/oci_out.txt
+              --display-name trading-bot > /tmp/oci_out.txt 2>&1
+            RC=$?
+            if [ $RC -eq 0 ]; then
+              CREATED=true
+              echo "SUCCESS! Instance created."
+              python3 -c "import json; d=json.load(open('/tmp/oci_out.txt'))['data']; print('IP:', d.get('public-ip','pending'))" || true
+              break
+            else
+              echo "$AD failed (exit $RC):"
+              cat /tmp/oci_out.txt | head -5
+            fi
           done
-
-          if $CREATED; then
-            echo "SUCCESS! Instance created."
-            python3 -c "import json; d=json.load(open('/tmp/oci_out.txt'))['data']; print('IP:', d.get('public-ip','pending'))" || true
-          else
+          if [ "$CREATED" = "false" ]; then
             echo "All ADs at capacity — will retry in 10 min"
           fi
           exit 0
