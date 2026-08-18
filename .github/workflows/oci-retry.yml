@@ -7,6 +7,8 @@ on:
       setup_toronto:
         description: 'Run Toronto one-time setup (yes/no)'
         default: 'no'
+permissions:
+  contents: write
 jobs:
   create-instance:
     runs-on: ubuntu-latest
@@ -45,14 +47,14 @@ jobs:
           VCN=$(oci network vcn create \
             --compartment-id "$TENANCY" \
             --cidr-block 10.0.0.0/16 \
-            --display-name trading-bot-vcn \
-            --dns-label tradingbot \
+            --display-name trading-bot-vcn-tor \
+            --dns-label tradingbottor \
             --query "data.id" --raw-output 2>/dev/null)
           echo "VCN: $VCN"
           sleep 5
           IGW=$(oci network internet-gateway create \
             --compartment-id "$TENANCY" --vcn-id "$VCN" \
-            --is-enabled true --display-name trading-igw \
+            --is-enabled true --display-name trading-igw-tor \
             --query "data.id" --raw-output 2>/dev/null)
           RT=$(oci network route-table list \
             --compartment-id "$TENANCY" --vcn-id "$VCN" \
@@ -67,8 +69,8 @@ jobs:
             --egress-security-rules '[{"destination":"0.0.0.0/0","protocol":"all"}]' > /dev/null 2>&1
           SUBNET=$(oci network subnet create \
             --compartment-id "$TENANCY" --vcn-id "$VCN" \
-            --cidr-block 10.0.0.0/24 --display-name botsubnet \
-            --dns-label botsubnet --route-table-id "$RT" \
+            --cidr-block 10.0.0.0/24 --display-name botsubnet-tor \
+            --dns-label botsubnettor --route-table-id "$RT" \
             --security-list-ids "[\"$SL\"]" \
             --query "data.id" --raw-output 2>/dev/null)
           IMAGE=$(oci compute image list \
@@ -94,6 +96,7 @@ jobs:
           git add toronto-config.txt
           git commit -m "chore: save Toronto OCIDs from setup run"
           git push
+          echo "Toronto setup complete. Scheduled runs will now also try Toronto."
       - name: Check if already running
         id: check
         if: github.event.inputs.setup_toronto != 'yes'
@@ -137,6 +140,8 @@ jobs:
             fi
           done
           echo "created=$CREATED" >> $GITHUB_OUTPUT
+          [ "$CREATED" = "false" ] && echo "All Ashburn ADs at capacity"
+          exit 0
       - name: Try Toronto
         if: github.event.inputs.setup_toronto != 'yes' && steps.check.outputs.count == '0' && steps.ashburn.outputs.created != 'true' && hashFiles('toronto-config.txt') != ''
         run: |
@@ -148,8 +153,7 @@ jobs:
           fi
           sed -i 's/region=us-ashburn-1/region=ca-toronto-1/' ~/.oci/config
           printf '%s\n' '${{ secrets.SSH_PUBLIC_KEY }}' > /tmp/ssh_key.pub
-          echo "Using subnet: $TORONTO_SUBNET"
-          echo "Using image:  $TORONTO_IMAGE"
+          echo "Trying Toronto..."
           for AD in $TORONTO_ADS; do
             echo "Trying Toronto $AD..."
             oci compute instance launch \
