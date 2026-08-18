@@ -3,10 +3,15 @@ on:
   schedule:
     - cron: '*/1 * * * *'
   workflow_dispatch:
+    inputs:
+      setup_toronto:
+        description: 'Run Toronto one-time setup (yes/no)'
+        default: 'no'
 jobs:
   create-instance:
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
       - name: Install OCI CLI
         run: pip install oci-cli --quiet
       - name: Configure OCI
@@ -22,8 +27,76 @@ jobs:
           printf '[DEFAULT]\nuser=%s\nfingerprint=%s\ntenancy=%s\nregion=us-ashburn-1\nkey_file=%s\n' \
             "$OCI_USER" "$OCI_FP" "$OCI_TENANCY" ~/.oci/key.pem > ~/.oci/config
           echo "TENANCY=$OCI_TENANCY" >> $GITHUB_ENV
+      - name: Toronto one-time setup
+        if: github.event.inputs.setup_toronto == 'yes'
+        run: |
+          set +e
+          sed -i 's/region=us-ashburn-1/region=ca-toronto-1/' ~/.oci/config
+
+          SUBSCRIBED=$(oci iam region-subscription list --tenancy-id "$TENANCY" \
+            --query "data[?\"region-name\"=='ca-toronto-1'].status | [0]" \
+            --raw-output 2>/dev/null)
+          echo "Toronto subscription status: $SUBSCRIBED"
+          if [ "$SUBSCRIBED" != "READY" ]; then
+            echo "ERROR: Toronto not subscribed. Go to OCI Console > Tenancy > Subscribe to ca-toronto-1 first."
+            exit 1
+          fi
+
+          VCN=$(oci network vcn create \
+            --compartment-id "$TENANCY" \
+            --cidr-block 10.0.0.0/16 \
+            --display-name trading-bot-vcn \
+            --dns-label tradingbot \
+            --query "data.id" --raw-output 2>/dev/null)
+          echo "VCN: $VCN"
+          sleep 5
+          IGW=$(oci network internet-gateway create \
+            --compartment-id "$TENANCY" --vcn-id "$VCN" \
+            --is-enabled true --display-name trading-igw \
+            --query "data.id" --raw-output 2>/dev/null)
+          RT=$(oci network route-table list \
+            --compartment-id "$TENANCY" --vcn-id "$VCN" \
+            --query "data[0].id" --raw-output 2>/dev/null)
+          oci network route-table update --rt-id "$RT" --force \
+            --route-rules "[{\"destination\":\"0.0.0.0/0\",\"networkEntityId\":\"$IGW\"}]" > /dev/null 2>&1
+          SL=$(oci network security-list list \
+            --compartment-id "$TENANCY" --vcn-id "$VCN" \
+            --query "data[0].id" --raw-output 2>/dev/null)
+          oci network security-list update --security-list-id "$SL" --force \
+            --ingress-security-rules '[{"source":"0.0.0.0/0","protocol":"6","tcpOptions":{"destinationPortRange":{"min":22,"max":22}}}]' \
+            --egress-security-rules '[{"destination":"0.0.0.0/0","protocol":"all"}]' > /dev/null 2>&1
+          SUBNET=$(oci network subnet create \
+            --compartment-id "$TENANCY" --vcn-id "$VCN" \
+            --cidr-block 10.0.0.0/24 --display-name botsubnet \
+            --dns-label botsubnet --route-table-id "$RT" \
+            --security-list-ids "[\"$SL\"]" \
+            --query "data.id" --raw-output 2>/dev/null)
+          IMAGE=$(oci compute image list \
+            --compartment-id "$TENANCY" \
+            --operating-system "Canonical Ubuntu" \
+            --operating-system-version "22.04" \
+            --shape VM.Standard.A1.Flex \
+            --sort-by TIMECREATED --sort-order DESC \
+            --limit 1 \
+            --query "data[0].id" --raw-output 2>/dev/null)
+          ADS=$(oci iam availability-domain list \
+            --compartment-id "$TENANCY" \
+            --query "join(' ', data[*].name)" --raw-output 2>/dev/null)
+
+          echo "TORONTO_SUBNET=$SUBNET"
+          echo "TORONTO_IMAGE=$IMAGE"
+          echo "TORONTO_ADS=$ADS"
+
+          printf 'TORONTO_SUBNET=%s\nTORONTO_IMAGE=%s\nTORONTO_ADS=%s\n' \
+            "$SUBNET" "$IMAGE" "$ADS" > toronto-config.txt
+          git config user.email "actions@github.com"
+          git config user.name "GitHub Actions"
+          git add toronto-config.txt
+          git commit -m "chore: save Toronto OCIDs from setup run"
+          git push
       - name: Check if already running
         id: check
+        if: github.event.inputs.setup_toronto != 'yes'
         run: |
           set +e
           COUNT=$(oci compute instance list \
@@ -36,7 +109,7 @@ jobs:
           echo "Existing running instances: $COUNT"
       - name: Try Ashburn
         id: ashburn
-        if: steps.check.outputs.count == '0'
+        if: github.event.inputs.setup_toronto != 'yes' && steps.check.outputs.count == '0'
         run: |
           set +e
           SUBNET="ocid1.subnet.oc1.iad.aaaaaaaal3biypdof4bydty32oauen3sv5y22s2nos4zkdb3o2cgghyx5u4a"
@@ -65,90 +138,26 @@ jobs:
           done
           echo "created=$CREATED" >> $GITHUB_OUTPUT
       - name: Try Toronto
-        if: steps.check.outputs.count == '0' && steps.ashburn.outputs.created != 'true'
+        if: github.event.inputs.setup_toronto != 'yes' && steps.check.outputs.count == '0' && steps.ashburn.outputs.created != 'true' && hashFiles('toronto-config.txt') != ''
         run: |
           set +e
-          printf '%s\n' '${{ secrets.SSH_PUBLIC_KEY }}' > /tmp/ssh_key.pub
+          source toronto-config.txt
+          if [ -z "$TORONTO_SUBNET" ] || [ -z "$TORONTO_IMAGE" ]; then
+            echo "Toronto config incomplete — skipping"
+            exit 0
+          fi
           sed -i 's/region=us-ashburn-1/region=ca-toronto-1/' ~/.oci/config
-
-          # Verify Toronto is subscribed
-          SUBSCRIBED=$(oci iam region-subscription list --tenancy-id "$TENANCY" \
-            --query "data[?\"region-name\"=='ca-toronto-1'].status | [0]" \
-            --raw-output 2>/dev/null)
-          if [ "$SUBSCRIBED" != "READY" ]; then
-            echo "Toronto not subscribed (status: '$SUBSCRIBED') — skipping"
-            exit 0
-          fi
-          echo "Toronto is subscribed"
-
-          # Get or create subnet (no --wait-for-state to avoid blocking)
-          SUBNET=$(oci network subnet list \
-            --compartment-id "$TENANCY" --display-name botsubnet \
-            --query "data[0].id" --raw-output 2>/dev/null)
-
-          if [ -z "$SUBNET" ]; then
-            echo "Creating Toronto VCN..."
-            VCN=$(oci network vcn create \
-              --compartment-id "$TENANCY" \
-              --cidr-block 10.0.0.0/16 \
-              --display-name trading-bot-vcn \
-              --dns-label tradingbot \
-              --query "data.id" --raw-output 2>/dev/null)
-            echo "VCN: $VCN"
-            sleep 5
-            IGW=$(oci network internet-gateway create \
-              --compartment-id "$TENANCY" --vcn-id "$VCN" \
-              --is-enabled true --display-name trading-igw \
-              --query "data.id" --raw-output 2>/dev/null)
-            RT=$(oci network route-table list \
-              --compartment-id "$TENANCY" --vcn-id "$VCN" \
-              --query "data[0].id" --raw-output 2>/dev/null)
-            oci network route-table update --rt-id "$RT" --force \
-              --route-rules "[{\"destination\":\"0.0.0.0/0\",\"networkEntityId\":\"$IGW\"}]" > /dev/null 2>&1
-            SL=$(oci network security-list list \
-              --compartment-id "$TENANCY" --vcn-id "$VCN" \
-              --query "data[0].id" --raw-output 2>/dev/null)
-            oci network security-list update --security-list-id "$SL" --force \
-              --ingress-security-rules '[{"source":"0.0.0.0/0","protocol":"6","tcpOptions":{"destinationPortRange":{"min":22,"max":22}}}]' \
-              --egress-security-rules '[{"destination":"0.0.0.0/0","protocol":"all"}]' > /dev/null 2>&1
-            SUBNET=$(oci network subnet create \
-              --compartment-id "$TENANCY" --vcn-id "$VCN" \
-              --cidr-block 10.0.0.0/24 --display-name botsubnet \
-              --dns-label botsubnet --route-table-id "$RT" \
-              --security-list-ids "[\"$SL\"]" \
-              --query "data.id" --raw-output 2>/dev/null)
-            echo "Created subnet: $SUBNET"
-          else
-            echo "Using existing subnet: $SUBNET"
-          fi
-
-          # Get latest Ubuntu 22.04 ARM image for Toronto
-          IMAGE=$(oci compute image list \
-            --compartment-id "$TENANCY" \
-            --operating-system "Canonical Ubuntu" \
-            --operating-system-version "22.04" \
-            --shape VM.Standard.A1.Flex \
-            --sort-by TIMECREATED --sort-order DESC \
-            --limit 1 \
-            --query "data[0].id" --raw-output 2>/dev/null)
-          echo "Image: $IMAGE"
-
-          if [ -z "$SUBNET" ] || [ -z "$IMAGE" ]; then
-            echo "Missing subnet ($SUBNET) or image ($IMAGE) — skipping Toronto"
-            exit 0
-          fi
-
-          # Toronto only has 1 AD
-          for AD in $(oci iam availability-domain list \
-            --compartment-id "$TENANCY" \
-            --query "join(' ', data[*].name)" --raw-output 2>/dev/null); do
+          printf '%s\n' '${{ secrets.SSH_PUBLIC_KEY }}' > /tmp/ssh_key.pub
+          echo "Using subnet: $TORONTO_SUBNET"
+          echo "Using image:  $TORONTO_IMAGE"
+          for AD in $TORONTO_ADS; do
             echo "Trying Toronto $AD..."
             oci compute instance launch \
               --compartment-id "$TENANCY" \
               --availability-domain "$AD" \
               --shape VM.Standard.A1.Flex \
               --shape-config '{"ocpus":2,"memoryInGBs":12}' \
-              --image-id "$IMAGE" --subnet-id "$SUBNET" \
+              --image-id "$TORONTO_IMAGE" --subnet-id "$TORONTO_SUBNET" \
               --assign-public-ip true \
               --ssh-authorized-keys-file /tmp/ssh_key.pub \
               --display-name trading-bot > /tmp/oci_out.txt 2>&1
