@@ -34,7 +34,7 @@ jobs:
           [ -z "$COUNT" ] && COUNT="0"
           echo "count=$COUNT" >> $GITHUB_OUTPUT
           echo "Existing running instances: $COUNT"
-      - name: Try Ashburn ADs
+      - name: Try Ashburn
         id: ashburn
         if: steps.check.outputs.count == '0'
         run: |
@@ -50,8 +50,7 @@ jobs:
               --availability-domain "$AD" \
               --shape VM.Standard.A1.Flex \
               --shape-config '{"ocpus":2,"memoryInGBs":12}' \
-              --image-id "$IMAGE" \
-              --subnet-id "$SUBNET" \
+              --image-id "$IMAGE" --subnet-id "$SUBNET" \
               --assign-public-ip true \
               --ssh-authorized-keys-file /tmp/ssh_key.pub \
               --display-name trading-bot > /tmp/oci_out.txt 2>&1
@@ -61,52 +60,53 @@ jobs:
               python3 -c "import json; d=json.load(open('/tmp/oci_out.txt'))['data']; print('IP:', d.get('public-ip','pending'))" || true
               break
             else
-              echo "$AD failed: $(head -2 /tmp/oci_out.txt)"
+              echo "$AD failed: $(head -1 /tmp/oci_out.txt)"
             fi
           done
           echo "created=$CREATED" >> $GITHUB_OUTPUT
-      - name: Try Toronto ADs
+      - name: Try Toronto
         if: steps.check.outputs.count == '0' && steps.ashburn.outputs.created != 'true'
         run: |
           set +e
           printf '%s\n' '${{ secrets.SSH_PUBLIC_KEY }}' > /tmp/ssh_key.pub
-
-          # Switch OCI config to Toronto
           sed -i 's/region=us-ashburn-1/region=ca-toronto-1/' ~/.oci/config
 
-          # Check if Toronto is subscribed
+          # Verify Toronto is subscribed
           SUBSCRIBED=$(oci iam region-subscription list --tenancy-id "$TENANCY" \
-            --query "data[?\"region-name\"=='ca-toronto-1'].status | [0]" --raw-output 2>/dev/null)
+            --query "data[?\"region-name\"=='ca-toronto-1'].status | [0]" \
+            --raw-output 2>/dev/null)
           if [ "$SUBSCRIBED" != "READY" ]; then
-            echo "Toronto not subscribed (status: $SUBSCRIBED) — skipping"
+            echo "Toronto not subscribed (status: '$SUBSCRIBED') — skipping"
             exit 0
           fi
           echo "Toronto is subscribed"
 
-          # Get or create subnet
+          # Get or create subnet (no --wait-for-state to avoid blocking)
           SUBNET=$(oci network subnet list \
-            --compartment-id "$TENANCY" \
-            --display-name botsubnet \
+            --compartment-id "$TENANCY" --display-name botsubnet \
             --query "data[0].id" --raw-output 2>/dev/null)
 
           if [ -z "$SUBNET" ]; then
-            echo "Creating Toronto networking..."
+            echo "Creating Toronto VCN..."
             VCN=$(oci network vcn create \
               --compartment-id "$TENANCY" \
               --cidr-block 10.0.0.0/16 \
               --display-name trading-bot-vcn \
               --dns-label tradingbot \
-              --wait-for-state AVAILABLE \
               --query "data.id" --raw-output 2>/dev/null)
+            echo "VCN: $VCN"
+            sleep 5
             IGW=$(oci network internet-gateway create \
               --compartment-id "$TENANCY" --vcn-id "$VCN" \
               --is-enabled true --display-name trading-igw \
               --query "data.id" --raw-output 2>/dev/null)
-            RT=$(oci network route-table list --compartment-id "$TENANCY" --vcn-id "$VCN" \
+            RT=$(oci network route-table list \
+              --compartment-id "$TENANCY" --vcn-id "$VCN" \
               --query "data[0].id" --raw-output 2>/dev/null)
             oci network route-table update --rt-id "$RT" --force \
               --route-rules "[{\"destination\":\"0.0.0.0/0\",\"networkEntityId\":\"$IGW\"}]" > /dev/null 2>&1
-            SL=$(oci network security-list list --compartment-id "$TENANCY" --vcn-id "$VCN" \
+            SL=$(oci network security-list list \
+              --compartment-id "$TENANCY" --vcn-id "$VCN" \
               --query "data[0].id" --raw-output 2>/dev/null)
             oci network security-list update --security-list-id "$SL" --force \
               --ingress-security-rules '[{"source":"0.0.0.0/0","protocol":"6","tcpOptions":{"destinationPortRange":{"min":22,"max":22}}}]' \
@@ -119,10 +119,10 @@ jobs:
               --query "data.id" --raw-output 2>/dev/null)
             echo "Created subnet: $SUBNET"
           else
-            echo "Using existing Toronto subnet: $SUBNET"
+            echo "Using existing subnet: $SUBNET"
           fi
 
-          # Get latest Ubuntu 22.04 ARM image
+          # Get latest Ubuntu 22.04 ARM image for Toronto
           IMAGE=$(oci compute image list \
             --compartment-id "$TENANCY" \
             --operating-system "Canonical Ubuntu" \
@@ -134,22 +134,21 @@ jobs:
           echo "Image: $IMAGE"
 
           if [ -z "$SUBNET" ] || [ -z "$IMAGE" ]; then
-            echo "Missing subnet or image — Toronto setup failed"
+            echo "Missing subnet ($SUBNET) or image ($IMAGE) — skipping Toronto"
             exit 0
           fi
 
-          # Try all Toronto ADs
+          # Toronto only has 1 AD
           for AD in $(oci iam availability-domain list \
             --compartment-id "$TENANCY" \
-            --query "data[*].name" --raw-output 2>/dev/null | tr ',' '\n' | tr -d ' []"'); do
+            --query "join(' ', data[*].name)" --raw-output 2>/dev/null); do
             echo "Trying Toronto $AD..."
             oci compute instance launch \
               --compartment-id "$TENANCY" \
               --availability-domain "$AD" \
               --shape VM.Standard.A1.Flex \
               --shape-config '{"ocpus":2,"memoryInGBs":12}' \
-              --image-id "$IMAGE" \
-              --subnet-id "$SUBNET" \
+              --image-id "$IMAGE" --subnet-id "$SUBNET" \
               --assign-public-ip true \
               --ssh-authorized-keys-file /tmp/ssh_key.pub \
               --display-name trading-bot > /tmp/oci_out.txt 2>&1
@@ -158,7 +157,7 @@ jobs:
               python3 -c "import json; d=json.load(open('/tmp/oci_out.txt'))['data']; print('IP:', d.get('public-ip','pending'))" || true
               exit 0
             else
-              echo "$AD failed: $(head -2 /tmp/oci_out.txt)"
+              echo "$AD failed: $(head -1 /tmp/oci_out.txt)"
             fi
           done
           echo "All Toronto ADs at capacity — will retry in 1 min"
