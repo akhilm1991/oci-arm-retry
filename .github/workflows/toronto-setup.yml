@@ -1,4 +1,4 @@
-name: Toronto Setup (run once)
+name: Toronto Setup
 on:
   workflow_dispatch:
 jobs:
@@ -7,44 +7,31 @@ jobs:
     steps:
       - name: Install OCI CLI
         run: pip install oci-cli --quiet
-      - name: Configure OCI (Toronto)
+      - name: Configure OCI Toronto
+        env:
+          OCI_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+          OCI_USER: ${{ secrets.OCI_USER_OCID }}
+          OCI_FP: ${{ secrets.OCI_FINGERPRINT }}
+          OCI_TENANCY: ${{ secrets.OCI_TENANCY_OCID }}
         run: |
           mkdir -p ~/.oci
-          printf '%s' '${{ secrets.OCI_PRIVATE_KEY }}' > ~/.oci/key.pem
+          printf '%s' "$OCI_KEY" > ~/.oci/key.pem
           chmod 600 ~/.oci/key.pem
-          cat > ~/.oci/config << EOF
-          [DEFAULT]
-          user=${{ secrets.OCI_USER_OCID }}
-          fingerprint=${{ secrets.OCI_FINGERPRINT }}
-          tenancy=${{ secrets.OCI_TENANCY_OCID }}
-          region=ca-toronto-1
-          key_file=$HOME/.oci/key.pem
-          EOF
-      - name: Check region subscription and create networking
+          printf '[DEFAULT]
+user=%s
+fingerprint=%s
+tenancy=%s
+region=ca-toronto-1
+key_file=%s
+'             "$OCI_USER" "$OCI_FP" "$OCI_TENANCY" ~/.oci/key.pem > ~/.oci/config
+      - name: Get Toronto info
+        env:
+          OCI_TENANCY: ${{ secrets.OCI_TENANCY_OCID }}
         run: |
           set +e
-          COMPARTMENT="${{ secrets.OCI_TENANCY_OCID }}"
-
-          echo "=== Checking region subscription ==="
-          oci iam region-subscription list --tenancy-id "$COMPARTMENT" 2>&1 | python3 -c "
-import sys, json
-try:
-    data = json.load(sys.stdin)
-    for r in data.get('data', []):
-        print(r['region-name'], r['status'])
-except:
-    print(sys.stdin.read())
-" || true
-
-          echo "=== Creating VCN ==="
-          VCN_ID=$(oci network vcn create \
-            --compartment-id "$COMPARTMENT" \
-            --cidr-block 10.0.0.0/16 \
-            --display-name trading-bot-vcn \
-            --dns-label tradingbot \
-            --query "data.id" --raw-output 2>&1)
-          echo "VCN result: $VCN_ID"
-
-          echo "=== Listing ADs ==="
-          oci iam availability-domain list \
-            --compartment-id "$COMPARTMENT" 2>&1
+          echo === Subscribed regions ===
+          oci iam region-subscription list --tenancy-id "$OCI_TENANCY" --output table 2>&1
+          echo === Availability domains ===
+          oci iam availability-domain list --compartment-id "$OCI_TENANCY" --output table 2>&1
+          echo === Ubuntu ARM image ===
+          oci compute image list --compartment-id "$OCI_TENANCY" --operating-system "Canonical Ubuntu" --operating-system-version "22.04" --shape VM.Standard.A1.Flex --sort-by TIMECREATED --sort-order DESC --limit 1 --output table 2>&1
